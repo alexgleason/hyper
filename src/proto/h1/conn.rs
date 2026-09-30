@@ -883,6 +883,16 @@ where
                 self.state.writing = Writing::Closed;
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
+            if n > len {
+                // The IO claims more than it was asked to send, so the
+                // body's framing can no longer be trusted.
+                self.state.send_file = None;
+                self.state.writing = Writing::Closed;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "poll_write_file wrote more than requested",
+                )));
+            }
             trace!("sent {} bytes from file", n);
             file.offset += n as u64;
             encoder.wrote_length(n as u64);

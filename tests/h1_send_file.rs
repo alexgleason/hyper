@@ -46,6 +46,8 @@ struct FileIo {
     supports: bool,
     file_writes: Arc<AtomicUsize>,
     ready: bool,
+    /// Added to every count `poll_write_file` reports, to act as a broken IO.
+    overreport: usize,
 }
 
 impl Read for FileIo {
@@ -101,7 +103,7 @@ impl Write for FileIo {
         if let Poll::Ready(Ok(_)) = written {
             self.file_writes.fetch_add(1, Ordering::SeqCst);
         }
-        written
+        written.map_ok(|n| n + self.overreport)
     }
 }
 
@@ -158,6 +160,25 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    serve_io(builder, supports, 0, respond).await
+}
+
+async fn serve_io<F, B>(
+    builder: http1::Builder,
+    supports: bool,
+    overreport: usize,
+    respond: F,
+) -> (
+    TcpStream,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<hyper::Result<()>>,
+)
+where
+    F: Fn() -> Response<B> + Send + Sync + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let file_writes = Arc::new(AtomicUsize::new(0));
@@ -171,6 +192,7 @@ where
             supports,
             file_writes: counter,
             ready: false,
+            overreport,
         };
         let service = service_fn(move |_req| {
             let respond = respond.clone();
@@ -509,6 +531,34 @@ async fn errors_when_the_file_is_shorter_than_its_length() {
     client.read_to_end(&mut received).await.unwrap();
     assert!(
         received.ends_with(FILE),
+        "{:?}",
+        String::from_utf8_lossy(&received)
+    );
+}
+
+#[tokio::test]
+async fn errors_when_the_io_reports_more_than_it_was_asked_for() {
+    let (_tmp, file) = TempFile::new("overreport");
+    let (mut client, _, server) = serve_io(http1::Builder::new(), true, 1, move || {
+        with_file(&file, 0, 4, b"xxxx")
+    })
+    .await;
+
+    client.write_all(GET).await.unwrap();
+    let result = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("connection never finished")
+        .unwrap();
+    result.expect_err("an IO that over-reports must fail the connection");
+
+    // Nothing may follow the body the head framed, or the client would read
+    // the rest of the file as the start of another response.
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).await.unwrap();
+    let end = find(&received, b"\r\n\r\n").expect("no response head") + 4;
+    assert_eq!(
+        &received[end..],
+        &FILE[..4],
         "{:?}",
         String::from_utf8_lossy(&received)
     );
